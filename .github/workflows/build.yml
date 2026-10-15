@@ -1,0 +1,153 @@
+name: Build TWRP
+
+on:
+  push:
+    branches: [android-12.1]
+    tags: ['v*']
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a GitHub release after building
+        type: boolean
+        default: false
+      tag:
+        description: Release tag (required when releasing from a manual run)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: twrp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MANIFEST_URL: https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
+  MANIFEST_BRANCH: twrp-12.1
+  DEVICE_PATH: device/samsung/exynos9820
+
+jobs:
+  build:
+    name: ${{ matrix.device }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [beyond0lte, beyond1lte, beyond2lte, beyondx, d1, d1xks, d2s, d2x]
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses-dev \
+            x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
+            libxml2-utils xsltproc unzip fontconfig python-is-python3 \
+            rsync bc lz4 libssl-dev
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
+
+      - name: Checkout device tree
+        uses: actions/checkout@v4
+        with:
+          path: device-tree
+
+      - name: Sync TWRP minimal manifest
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/twrp"
+          cd "$GITHUB_WORKSPACE/twrp"
+          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
+          repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle --no-tags
+
+      - name: Place device tree
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/twrp/$DEVICE_PATH"
+          rsync -a --exclude '.git' --exclude '.github' \
+            "$GITHUB_WORKSPACE/device-tree/" "$GITHUB_WORKSPACE/twrp/$DEVICE_PATH/"
+
+      - name: Build recovery image
+        run: |
+          cd "$GITHUB_WORKSPACE/twrp"
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          source build/envsetup.sh
+          lunch twrp_${{ matrix.device }}-eng
+          mka -j"$(nproc --all)" recoveryimage
+
+      - name: Package (raw .img + Odin .tar)
+        run: |
+          DEV=${{ matrix.device }}
+          DATE=$(date -u +%Y%m%d)
+          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/$DEV"
+          DIST="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$DIST"
+          cp "$OUT/recovery.img" "$DIST/twrp-$DEV-$DATE.img"
+          # Odin expects a tar containing recovery.img
+          (cd "$OUT" && tar -H ustar -cf "$DIST/twrp-$DEV-$DATE.tar" recovery.img)
+          ls -lh "$DIST"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-${{ matrix.device }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG="build-$(date -u +%Y%m%d-%H%M)"
+          fi
+          echo "name=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: twrp-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          ls -lh
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          name: TWRP ${{ steps.tag.outputs.name }}
+          files: dist/*
+          generate_release_notes: true
+          
