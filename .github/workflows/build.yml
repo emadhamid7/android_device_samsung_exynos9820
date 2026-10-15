@@ -3,7 +3,6 @@ name: Build TWRP
 on:
   push:
     branches: [android-12.1]
-    tags: ['v*']
     paths-ignore: ['**.md']
   workflow_dispatch:
     inputs:
@@ -11,10 +10,6 @@ on:
         description: Publish a GitHub release after building
         type: boolean
         default: false
-      tag:
-        description: Release tag (required when releasing from a manual run)
-        type: string
-        default: ''
 
 permissions:
   contents: read
@@ -92,13 +87,12 @@ jobs:
       - name: Package (raw .img + Odin .tar)
         run: |
           DEV=${{ matrix.device }}
-          DATE=$(date -u +%Y%m%d)
           OUT="$GITHUB_WORKSPACE/twrp/out/target/product/$DEV"
           DIST="$GITHUB_WORKSPACE/dist"
           mkdir -p "$DIST"
-          cp "$OUT/recovery.img" "$DIST/twrp-$DEV-$DATE.img"
+          cp "$OUT/recovery.img" "$DIST/${DEV}_twrp_recovery.img"
           # Odin expects a tar containing recovery.img
-          (cd "$OUT" && tar -H ustar -cf "$DIST/twrp-$DEV-$DATE.tar" recovery.img)
+          (cd "$OUT" && tar -H ustar -cf "$DIST/${DEV}_odin_flashpack.tar" recovery.img)
           ls -lh "$DIST"
 
       - name: Upload artifact
@@ -117,18 +111,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Resolve tag
-        id: tag
-        run: |
-          TAG="${{ inputs.tag }}"
-          if [ -z "$TAG" ] && [ "${{ github.ref_type }}" = "tag" ]; then
-            TAG="${{ github.ref_name }}"
-          fi
-          if [ -z "$TAG" ]; then
-            TAG="build-$(date -u +%Y%m%d-%H%M)"
-          fi
-          echo "name=$TAG" >> "$GITHUB_OUTPUT"
-
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -136,18 +118,29 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Generate checksums
+      - name: Split files and generate checksums
         run: |
-          cd dist
-          sha256sum * > SHA256SUMS.txt
-          ls -lh
+          mkdir -p odin img
+          mv dist/*_odin_flashpack.tar odin/
+          mv dist/*_twrp_recovery.img img/
+          (cd odin && sha256sum * > SHA256SUMS.txt)
+          (cd img && sha256sum * > SHA256SUMS.txt)
+          ls -lh odin img
 
-      - name: Create release
+      - name: Create Odin flashpack release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
+          tag_name: Exynos-9820-TWRP-Odin
           target_commitish: ${{ github.sha }}
-          name: TWRP ${{ steps.tag.outputs.name }}
-          files: dist/*
+          name: Exynos 9820 TWRP (Odin)
+          files: odin/*
           generate_release_notes: true
-          
+
+      - name: Create recovery image release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: Exynos-9820-TWRP-IMG
+          target_commitish: ${{ github.sha }}
+          name: Exynos 9820 TWRP (IMG)
+          files: img/*
+          generate_release_notes: true
